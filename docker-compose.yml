@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  weaviate:
+    image: semitechnologies/weaviate:1.25.3
+    restart: unless-stopped
+    ports:
+      - "8080:8080"  # Standard Weaviate port
+      - "50051:50051"  # gRPC port
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'text2vec-transformers'
+      ENABLE_MODULES: 'text2vec-transformers'
+      TRANSFORMERS_INFERENCE_API: 'http://t2v-transformers:8080'
+      CLUSTER_HOSTNAME: 'node1'
+      # Optional: Uncomment and set if you need to limit memory
+      # DEFAULT_VECTORIZER_MODULE_CONFIG: '{"model": "sentence-transformers/all-MiniLM-L6-v2"}'
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider",  "http://localhost:8080/v1/.well-known/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - weaviate_net
+    depends_on:
+      - t2v-transformers
+
+  t2v-transformers:
+    image: semitechnologies/transformers-inference:sentence-transformers-all-MiniLM-L6-v2
+    restart: unless-stopped
+    environment:
+      ENABLE_CUDA: '0'  # Change to '1' if you have an NVIDIA GPU with drivers installed
+      # Optional: Limit memory usage (in MB)
+      # MAX_INPUT_LENGTH: 512
+      # MODEL_CACHE_SIZE: '2048'
+    ports:
+      - "8081:8080"  # Only expose if you need to access the transformers API directly
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider",  "http://localhost:8080/.well-known/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - weaviate_net
+
+volumes:
+  weaviate_data:
+
+networks:
+  weaviate_net:
