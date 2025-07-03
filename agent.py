@@ -5,16 +5,18 @@ import json
 from dotenv import load_dotenv
 from datetime import datetime
 import weaviate
-from weaviate.classes.query import Filter
+from weaviate.classes.query import Filter, GroupBy
 import logging
 from langgraph.graph import StateGraph, END
 import re
 from functools import partial
 import urllib.parse
-from search_tools import SearchTools, normalize_filter_dict
+from search_tools import SearchTools, normalize_filter_dict, create_groupby_object
 from type import AgentState
 from query_decomposer import QueryDecomposer
 from formatting import log_tool_execution, flatten_results, convert_datetimes, format_search_results, format_group_results
+from collections import Counter
+from difflib import SequenceMatcher
 
 # Configure logging
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,47 +38,23 @@ load_dotenv()
 # Dynamic tool registry
 def get_tool_registry(search_tools):
     return {
-        "semantic_search": {
-            "func": search_tools.semantic_search,
-            "description": "Performs a semantic search using the given query or reference article.",
-            "parameters": ["query", "limit", "filter_dict", "reference_id", "score_threshold"],
-        },
         "filter_data": {
             "func": search_tools.filter_data,
-            "description": "Unified filtering that works on any data source (database or existing objects).",
-            "parameters": ["data_source", "filters", "limit", "source_type"]},
+            "description": "Unified filtering that works on any data source.",
+            "parameters": ["filters"]},
         "group_data": {
             "func": search_tools.group_data,
             "description": "Unified grouping that works on any data structure.",
-            "parameters": ["data", "group_field", "limit", "include_items", "max_items_per_group"]},
+            "parameters": ["group_field", "limit", "include_items", "max_items_per_group"]},
         "sort_data": {
             "func": search_tools.sort_data,
             "description": "Unified sorting that works on any data structure.",
             "parameters": ["data", "sort_field", "ascending"]},
-        "extract_field_values": {
-            "func": search_tools.extract_field_values,
-            "description": "Extract values for a specific field from any data structure.",
-            "parameters": ["data", "field_name", "limit"]},
-        "create_filter_from_values": {
-            "func": search_tools.create_filter_from_values,
-            "description": "Create a filter from a list of values (unified method).",
-            "parameters": ["values", "target_field", "limit"]},
-        "combine_results": { 
-            "func": search_tools.combine_results, 
-            "description": "Combines multiple result lists into one. Useful for merging results from different operations.", 
-            "parameters": ["results_list", "deduplicate"]},
-        "get_top_n": {
-            "func": search_tools.get_top_n,
-            "description": "Gets the top N objects from any data structure.",
-            "parameters": ["data", "n"]},
-        "find_item_by_field": {
-            "func": search_tools.find_item_by_field,
-            "description": "Finds an item by a specific field value and returns its Weaviate ID (UUID).",
-            "parameters": ["field_name", "field_value"]},
-        "transform_results": { 
-            "func": search_tools.transform_results, 
-            "description": "Transforms results into different formats. Useful for data preparation.", 
-            "parameters": ["objects", "transform_type"]},
+        "semantic_search": {
+            "func": search_tools.semantic_search,
+            "description": "Performs a semantic search using the given query or reference article.",
+            "parameters": ["query", "limit", "filter_dict", "reference_id", "score_threshold", "group_field", "max_items_per_group"],
+        },
     }
 
 # --- QUERY DECOMPOSITION ---
@@ -113,79 +91,50 @@ def validate_and_correct_plan(plan, schema_fields):
         if not isinstance(schema_fields, dict):
             logger.warning(f"schema_fields is not a dictionary in validate_and_correct_plan: {type(schema_fields)}, using empty dict")
             schema_fields = {}
-        
         valid_fields = set(schema_fields.keys())
         logical_operators = {'$and', '$or', '$not'}  # These are not field names
         steps = plan.get('steps', [])
-        
-        # --- PATCH: Fix incorrect author counting pattern ---
-        for i in range(len(steps) - 1):
-            if (i + 1 < len(steps) and 
-                steps[i]['tool'] == 'extract_field_values' and 
-                steps[i+1]['tool'] == 'group_data' and
-                steps[i]['parameters'].get('field_name') == 'author' and
-                steps[i+1]['parameters'].get('group_field') == 'value'):
-                
-                # This is the incorrect pattern - replace with direct grouping
-                logger.info("Fixing incorrect author counting pattern")
-                
-                # Remove the extract_field_values step
-                steps.pop(i)
-                
-                # Update the group_data step to group by author directly
-                steps[i]['parameters']['group_field'] = 'author'
-                steps[i]['parameters']['data'] = '$PREV_STEP_RESULT'
-                steps[i]['description'] = 'Group by author to count articles'
-                
-                # Update step IDs
-                for j in range(i, len(steps)):
-                    steps[j]['step_id'] = j + 1
-                
-                warnings.append(f"Fixed author counting pattern: replaced extract_field_values + group_data with direct group_data by author")
-                break
+
+        # --- PATCH: Merge semantic_search + group_data into a single semantic_search with group_by ---
+        i = 0
+        while i < len(steps) - 1:
+            step = steps[i]
+            next_step = steps[i+1]
+            if step['tool'] == 'semantic_search' and next_step['tool'] == 'group_data':
+                group_field = next_step['parameters'].get('group_field')
+                if group_field:
+                    # Merge group_field into semantic_search step
+                    step['parameters']['group_field'] = group_field
+                    # Optionally merge limit/max_items_per_group
+                    if 'limit' in next_step['parameters']:
+                        step['parameters']['limit'] = next_step['parameters']['limit']
+                    if 'max_items_per_group' in next_step['parameters']:
+                        step['parameters']['max_items_per_group'] = next_step['parameters']['max_items_per_group']
+                    # Remove the group_data step
+                    steps.pop(i+1)
+                    warnings.append(f"Merged semantic_search and group_data into a single semantic_search with group_by on '{group_field}'")
+                    # Do not increment i, check for further merges
+                    continue
+            i += 1
         
         for i, step in enumerate(steps):
             try:
                 params = step.get('parameters', {})
-                
+                # Remove obsolete tool handling
                 # Validate group_field
                 if 'group_field' in params and params['group_field'] not in valid_fields:
-                    # Check if this step follows extract_field_values
-                    if i > 0 and steps[i-1]['tool'] == 'extract_field_values':
-                        # For extract_field_values results, the field gets normalized to 'value'
-                        if params['group_field'] == steps[i-1]['parameters'].get('field_name'):
-                            params['group_field'] = 'value'
-                            warnings.append(f"Step {step['step_id']}: group_field '{steps[i-1]['parameters'].get('field_name')}' replaced with 'value' for extract_field_values results.")
-                        elif params['group_field'] == 'value':
-                            # LLM already correctly set it to 'value', this is valid
-                            warnings.append(f"Step {step['step_id']}: group_field 'value' is valid for extract_field_values results.")
-                        else:
-                            warnings.append(f"Step {step['step_id']}: group_field '{params['group_field']}' not in schema, removing group_by.")
-                            step['parameters']['group_field'] = None
-                    else:
-                        warnings.append(f"Step {step['step_id']}: group_field '{params['group_field']}' not in schema, removing group_by.")
-                        step['parameters']['group_field'] = None
-                        
+                    warnings.append(f"Step {step['step_id']}: group_field '{params['group_field']}' not in schema, removing group_by.")
+                    step['parameters']['group_field'] = None
                 # Validate sort_field
                 if 'sort_field' in params:
-                    # Handle group_by result sorting
-                    prev_tool = steps[i-1]['tool'] if i > 0 else None
-                    prev_prev_tool = steps[i-2]['tool'] if i > 1 else None
-                    
-                    if params['sort_field'] == 'count' and (prev_tool == 'group_by' or (prev_tool == 'get_top_n' and prev_prev_tool == 'group_by')):
-                        params['sort_field'] = 'item_count'
-                        warnings.append(f"Step {step['step_id']}: sort_field 'count' replaced with 'item_count' for group_by results.")
-                    elif params['sort_field'] not in valid_fields and params['sort_field'] not in ['item_count', 'article_count']:
+                    if params['sort_field'] not in valid_fields and params['sort_field'] not in ['item_count', 'article_count']:
                         warnings.append(f"Step {step['step_id']}: sort_field '{params['sort_field']}' not in schema, removing sort.")
                         step['parameters']['sort_field'] = None
-                        
                 # Validate and fix filters
                 if 'filters' in params:
-                    # --- PATCH: Handle filters that are strings ---
                     if isinstance(params['filters'], str):
                         filters_str = params['filters']
                         if filters_str.strip().startswith('$PREV_STEP_RESULT'):
-                            # Leave for substitution, skip validation
                             continue
                         else:
                             try:
@@ -194,61 +143,28 @@ def validate_and_correct_plan(plan, schema_fields):
                             except Exception:
                                 logger.warning(f"Step {step['step_id']}: filters is a string but not valid JSON: {filters_str}, skipping filter validation")
                                 continue
-                    
-                    # Ensure filters is a dictionary before processing
                     if not isinstance(params['filters'], dict):
                         logger.warning(f"Step {step['step_id']}: filters is not a dictionary: {type(params['filters'])}, skipping filter validation")
                         continue
-                        
                     to_remove = []
                     for f in list(params['filters'].keys()):
-                        # Don't remove logical operators - they are valid at the top level
                         if f not in valid_fields and f not in logical_operators:
                             warnings.append(f"Step {step['step_id']}: filter field '{f}' not in schema, removing filter.")
                             to_remove.append(f)
                     for f in to_remove:
                         del step['parameters']['filters'][f]
-                        
-                    # Fix field references after group_by operations
-                    for k, v in params['filters'].items():
-                        if isinstance(v, dict):
-                            for op, val in v.items():
-                                if isinstance(val, str) and val.startswith('$PREV_STEP_RESULT'):
-                                    # Check if this step follows a group_by operation
-                                    prev_tool = steps[i-1]['tool'] if i > 0 else None
-                                    prev_prev_tool = steps[i-2]['tool'] if i > 1 else None
-                                    
-                                    # If the previous step was group_by or get_top_n after group_by
-                                    if prev_tool == 'group_by' or (prev_tool == 'get_top_n' and prev_prev_tool == 'group_by'):
-                                        # Get the group field from the group_by step
-                                        group_field = None
-                                        if prev_tool == 'group_by':
-                                            group_field = steps[i-1]['parameters'].get('group_field')
-                                        elif prev_prev_tool == 'group_by':
-                                            group_field = steps[i-2]['parameters'].get('group_field')
-                                        
-                                        # Dynamically fix field references
-                                        if group_field and f'.{group_field}' in val:
-                                            new_val = val.replace(f'.{group_field}', '.group_name')
-                                            params['filters'][k][op] = new_val
-                                            warnings.append(f"Step {step['step_id']}: changed filter reference from '.{group_field}' to '.group_name' after group_by.")
-                                    
                 # Validate and fix filter_dict (for semantic_search)
                 if 'filter_dict' in params:
-                    # Ensure filter_dict is a dictionary before processing
                     if not isinstance(params['filter_dict'], dict):
                         logger.warning(f"Step {step['step_id']}: filter_dict is not a dictionary: {type(params['filter_dict'])}, skipping filter_dict validation")
                         continue
-                        
                     to_remove = []
                     for f in list(params['filter_dict'].keys()):
-                        # Don't remove logical operators - they are valid at the top level
                         if f not in valid_fields and f not in logical_operators:
                             warnings.append(f"Step {step['step_id']}: filter_dict field '{f}' not in schema, removing filter.")
                             to_remove.append(f)
                     for f in to_remove:
                         del step['parameters']['filter_dict'][f]
-                        
             except Exception as step_error:
                 logger.error(f"Error validating step {i}: {step_error}", exc_info=True)
                 warnings.append(f"Error validating step {i}: {step_error}")
@@ -259,68 +175,100 @@ def validate_and_correct_plan(plan, schema_fields):
         
     return plan, warnings
 
+def is_similarity_search(query: str) -> bool:
+    """Detect if the query is a similarity/semantic search using robust NLP heuristics."""
+    import re
+    from difflib import SequenceMatcher
+    
+    # Lowercase and strip query
+    q = query.lower().strip()
+    
+    # List of strong semantic intent phrases (word boundaries)
+    strong_patterns = [
+        r"\bsimilar( to| )?\b",
+        r"\brelated( to| )?\b",
+        r"\brelevant( to| )?\b",
+        r"\bsemantic(ally)?\b",
+        r"\bclosest( to| )?\b",
+        r"\bnearest( to| )?\b",
+        r"\bfind (articles|documents|items) (about|like|related to)\b",
+        r"\bfind (similar|related)\b",
+        r"\babout\b",
+        r"\bdiscuss\b",
+        r"\bdescribe\b",
+        r"\btell me about\b",
+        r"\bwhat is\b",
+        r"\bwho is\b",
+        r"\bwhat are\b",
+        r"\bwho are\b",
+        r"\btopic of\b",
+        r"\bsubject of\b",
+        r"\bmeaning of\b",
+        r"\bexplain\b",
+        r"\bexplore\b",
+        r"\bdiscuss\b",
+        r"\bdescribe\b",
+        r"\bshow me (articles|missions|documents|items) about\b",
+    ]
+    # Check for any strong pattern
+    for pat in strong_patterns:
+        if re.search(pat, q):
+            return True
+    
+    # Fuzzy match for 'about', 'on', 'regarding', 'concerning' as topic indicators
+    topic_words = ['about', 'on', 'regarding', 'concerning']
+    for word in topic_words:
+        if f' {word} ' in q or q.startswith(word + ' '):
+            return True
+    
+    # Fuzzy match for queries that are questions (start with what/who/which/how/why)
+    if re.match(r'^(what|who|which|how|why)\b', q):
+        return True
+    
+    # Fuzzy match for queries that are long and descriptive (more likely semantic intent)
+    if len(q.split()) > 8 and any(w in q for w in ['about', 'describe', 'discuss', 'explain', 'topic']):
+        return True
+    
+    # Fuzzy ratio for similarity to known semantic prompts
+    semantic_examples = [
+        'find articles about', 'find documents about', 'find items like', 'find similar', 'find related',
+        'tell me about', 'what is', 'who is', 'describe', 'explain', 'discuss', 'topic of', 'subject of'
+    ]
+    for example in semantic_examples:
+        if SequenceMatcher(None, q, example).ratio() > 0.7:
+            return True
+    
+    return False
+
+def fill_missing_semantic_queries(plan, user_query):
+    for step in plan.get('steps', []):
+        if step.get('tool') == 'semantic_search':
+            params = step.get('parameters', {})
+            if not params.get('query') or not isinstance(params.get('query'), str) or not params.get('query').strip():
+                params['query'] = user_query
+    return plan
+
 def decompose_query_node(state: Dict[str, Any], search_tools, query_decomposer, tool_registry) -> Dict[str, Any]:
-    """Decompose a user query into a multi-step execution plan."""
+    """Decompose a user query into a multi-step execution plan using the LLM-based query_decomposer."""
     try:
         schema_fields = search_tools.get_schema_fields()
-        # Ensure schema_fields is a dictionary - handle all edge cases
         if not isinstance(schema_fields, dict):
             logger.warning(f"Retrieved schema_fields is not a dictionary: {type(schema_fields)}, using empty dict")
             schema_fields = {}
     except Exception as e:
         logger.error(f"Failed to get schema fields: {e}")
         schema_fields = {}
-    
-    try:
-        plan = query_decomposer.decompose(state['original_query'], search_tools.class_name, schema_fields, tool_registry)
-        
-        plan, plan_warnings = validate_and_correct_plan(plan, schema_fields)
-        
-        # Auto-append filter_objects step if last step is get_distinct_values
-        steps = plan.get('steps', [])
-        # Only auto-append if previous step is not extract_field_values or get_distinct_values
-        if steps and steps[-1]['tool'] == 'get_distinct_values':
-            prev_tool = steps[-2]['tool'] if len(steps) > 1 else None
-            if prev_tool not in ['extract_field_values', 'get_distinct_values']:
-                last_field = steps[-1]['parameters'].get('field', None)
-                if last_field:
-                    steps.append({
-                        "step_id": steps[-1]['step_id'] + 1,
-                        "tool": "filter_objects",
-                        "parameters": {
-                            "filters": {last_field: {"$in": "$PREV_STEP_RESULT"}},
-                            "limit": 1000
-                        },
-                        "description": f"Fetch all articles where {last_field} is in the previous result."
-                    })
-                    plan['steps'] = steps
-                    plan_warnings = plan_warnings or []
-                    plan_warnings.append("Auto-appended filter_objects step to fetch articles by values from get_distinct_values.")
-    except Exception as e:
-        logger.error(f"LLM-based planning failed with error: {e}", exc_info=True)
-        logger.warning(f"LLM-based planning failed: {e}, falling back to simple search.")
-        plan = {
-            "steps": [{
-                "step_id": 1,
-                "tool": "semantic_search",
-                "parameters": {"query": state['original_query'], "limit": 10},
-                "description": f"Fallback: Perform a search for '{state['original_query']}'."
-            }]
-        }
-        plan_warnings = ["LLM-based planning failed, using fallback plan."]
 
-    # Display the search plan
-    print("\n" + "="*60)
-    print("SEARCH PLAN")
-    print("="*60)
-    for step in plan['steps']:
-        print(f"Step {step['step_id']}: {step.get('description', 'No description available')}")
-    if plan_warnings:
-        print("\n[PLAN WARNINGS]")
-        for warning in plan_warnings:
-            print(f"  • {warning}")
-    print("="*60 + "\n")
-    
+    # Use the LLM-based query decomposer
+    plan = query_decomposer.decompose(
+        state['original_query'],
+        search_tools.class_name,
+        schema_fields,
+        tool_registry
+    )
+    plan = fill_missing_semantic_queries(plan, state['original_query'])
+    plan, plan_warnings = validate_and_correct_plan(plan, schema_fields)
+
     return {
         'plan': plan,
         'current_step': 1,
@@ -432,13 +380,11 @@ def substitute_prev_step_refs(value, prev_result):
     return value
 
 def execute_tool_node(state: AgentState, tool_registry=None, search_tools=None) -> Dict[str, Any]:
-    """Execute a single tool step in the research plan."""
+    """Accumulate query objects for each step, and only execute the query at the final step."""
     try:
         current_step_idx = state['current_step'] - 1
         step = state['plan']['steps'][current_step_idx]
         tool_name = step['tool']
-        
-        # Use the provided tool_registry or fall back to global TOOL_REGISTRY
         if tool_registry is None:
             if search_tools:
                 tool_registry = get_tool_registry(search_tools)
@@ -448,201 +394,113 @@ def execute_tool_node(state: AgentState, tool_registry=None, search_tools=None) 
         if not tool_info:
             raise ValueError(f"Unknown tool: {tool_name}")
         params = step.get('parameters', {}).copy()
-        # Get schema fields for validation - with fallback
-        try:
-            if search_tools:
-                schema_fields = search_tools.get_schema_fields()
+
+        # Accumulate query objects
+        filter_obj = state.get('filter_obj')
+        group_by_obj = state.get('group_by_obj')
+        sort_params = state.get('sort_params')
+        semantic_query = state.get('semantic_query', "")
+        is_last_step = (state['current_step'] == len(state['plan']['steps']))
+        result = None
+
+        # Only accumulate objects/params for each step
+        if tool_name == "filter_data":
+            filter_obj = tool_info['func'](**{k: v for k, v in params.items() if k in tool_info['parameters']})
+        elif tool_name == "group_data":
+            group_by_obj = params  # Save params for client-side grouping
+        elif tool_name == "sort_data":
+            sort_params = params
+        elif tool_name == "semantic_search":
+            new_query = step.get('parameters', {}).get('query', "")
+            if new_query and (not semantic_query or not semantic_query.strip()):
+                semantic_query = new_query
+
+        # --- NEW LOGIC: Push all filters/groupby into near_text if any semantic_search, else into fetch_objects ---
+        plan_steps = state['plan']['steps']
+        has_semantic = any(s['tool'] == 'semantic_search' for s in plan_steps)
+
+        # Collect all filters
+        filter_dicts = []
+        group_field = None
+        sort_field = None
+        ascending = True
+        semantic_queries = []
+        for s in plan_steps:
+            s_tool = s.get('tool')
+            s_params = s.get('parameters', {})
+            if s_tool == 'filter_data':
+                filters = s_params.get('filters', {})
+                if filters and isinstance(filters, dict) and len(filters) > 0:
+                    filter_dicts.append(filters)
+            elif s_tool == 'group_data':
+                group_field = s_params.get('group_field')
+            elif s_tool == 'sort_data':
+                sort_field = s_params.get('sort_field')
+                ascending = s_params.get('ascending', True)
+            elif s_tool == 'semantic_search':
+                q = s_params.get('query', "")
+                if q and isinstance(q, str) and q.strip():
+                    semantic_queries.append(q.strip())
+                # Also check for group_field in semantic_search step
+                if s_params.get('group_field'):
+                    group_field = s_params['group_field']
+
+        # Combine all filters with logical AND if more than one, ignore empty filters
+        if filter_dicts:
+            if len(filter_dicts) == 1:
+                combined_filter = filter_dicts[0]
             else:
-                schema_fields = {}
-            if not isinstance(schema_fields, dict):
-                logger.warning(f"Retrieved schema_fields is not a dictionary: {type(schema_fields)}, using empty dict")
-                schema_fields = {}
-        except Exception as e:
-            logger.warning(f"Failed to get schema fields: {e}, using empty schema")
-            schema_fields = {}
-        # Get previous result for chaining validation
-        prev_result = None
-        if state['intermediate_results']:
-            prev_result = state['intermediate_results'][-1]
-        # --- PATCH: Prevent get_distinct_values from running on a list of values ---
-        if tool_name == "get_distinct_values":
-            if prev_result is not None and (not isinstance(prev_result, list) or (prev_result and not isinstance(prev_result[0], dict))):
-                logger.warning("get_distinct_values called on non-object list, skipping step.")
-                # Skip this step, just pass through previous result
-                return {
-                    **state,
-                    'current_step': state['current_step'] + 1,
-                    'intermediate_results': state['intermediate_results'] + [prev_result],
-                    'final_results': prev_result if isinstance(prev_result, list) else [prev_result]
-                }
-        # FIRST: Substitute $PREV_STEP_RESULT and indexed/field references BEFORE validation
-        if state['intermediate_results']:
-            last_result = state['intermediate_results'][-1]
-            
-            # --- PATCH: Special handling for combine_results tool ---
-            if tool_name == "combine_results" and "results_list" in params:
-                # For combine_results, we need to substitute references to multiple previous results
-                results_list = params["results_list"]
-                if isinstance(results_list, list):
-                    substituted_results = []
-                    for i, ref in enumerate(results_list):
-                        if isinstance(ref, str) and ref.startswith("$PREV_STEP_RESULT"):
-                            # Extract the index from the reference
-                            if "[" in ref and "]" in ref:
-                                try:
-                                    # Parse index like [0], [1], etc.
-                                    start_idx = ref.find("[") + 1
-                                    end_idx = ref.find("]")
-                                    if start_idx > 0 and end_idx > start_idx:
-                                        idx_str = ref[start_idx:end_idx]
-                                        if idx_str.isdigit():
-                                            idx = int(idx_str)
-                                            # Get the result at the specified index
-                                            if 0 <= idx < len(state['intermediate_results']):
-                                                substituted_results.append(state['intermediate_results'][idx])
-                                            else:
-                                                logger.warning(f"Index {idx} out of range for intermediate_results, using empty list")
-                                                substituted_results.append([])
-                                        else:
-                                            logger.warning(f"Invalid index '{idx_str}' in reference '{ref}', using empty list")
-                                            substituted_results.append([])
-                                    else:
-                                        logger.warning(f"Could not parse index from reference '{ref}', using empty list")
-                                        substituted_results.append([])
-                                except Exception as e:
-                                    logger.warning(f"Error parsing reference '{ref}': {e}, using empty list")
-                                    substituted_results.append([])
-                            else:
-                                # No index specified, use the last result
-                                substituted_results.append(last_result)
-                        else:
-                            # Not a reference, use as-is
-                            substituted_results.append(ref)
-                    params["results_list"] = substituted_results
-                else:
-                    # Fallback to normal substitution
-                    params = substitute_prev_step_refs(params, last_result)
-            else:
-                # Normal substitution for other tools
-                params = substitute_prev_step_refs(params, last_result)
-            
-            if 'filters' in params and isinstance(params['filters'], str):
-                import json
-                filters_str = params['filters']
-                if filters_str.strip().startswith('$PREV_STEP_RESULT'):
-                    pass  # Leave for substitution
-                else:
-                    try:
-                        params['filters'] = json.loads(filters_str)
-                    except Exception:
-                        logger.warning(f"filters is a string but not valid JSON after substitution: {filters_str}, skipping parse")
-            if tool_name == "filter_existing_objects" and "objects" not in params:
-                params["objects"] = last_result
-        # SECOND: Validate chain compatibility
-        # Since validate_chain_compatibility now returns True for all valid cases,
-        # we don't need the fallback logic here
-        # if not validate_chain_compatibility(tool_name, params, prev_result):
-        #     logger.warning(f"Chain compatibility issue detected for {tool_name}, attempting fallback")
-        #     params = handle_chaining_fallback(tool_name, params, prev_result, schema_fields)
-        #     if state['intermediate_results']:
-        #         params = substitute_prev_step_refs(params, state['intermediate_results'][-1])
-        
-        # THIRD: Validate and normalize parameters
-        params = validate_tool_parameters(tool_name, params, schema_fields)
-        # FOURTH: Filter out unsupported parameters for each tool
-        supported_params = tool_info.get('parameters', [])
-        filtered_params = {k: v for k, v in params.items() if k in supported_params}
-        if filtered_params != params:
-            logger.warning(f"Removed unsupported parameters for {tool_name}: {set(params.keys()) - set(supported_params)}")
-            params = filtered_params
-        
-        # --- PATCH: Handle parameter name mismatches for unified tools ---
-        if tool_name == "extract_field_values" and "data" not in params and "objects" in params:
-            # Convert old parameter name to new unified parameter name
-            params["data"] = params.pop("objects")
-        
-        if tool_name == "group_data" and "data" not in params and "objects" in params:
-            # Convert old parameter name to new unified parameter name
-            params["data"] = params.pop("objects")
-        
-        if tool_name == "sort_data" and "data" not in params and "objects" in params:
-            # Convert old parameter name to new unified parameter name
-            params["data"] = params.pop("objects")
-        
-        if tool_name == "filter_data" and "data_source" not in params and "objects" in params:
-            # Convert old parameter name to new unified parameter name
-            params["data_source"] = params.pop("objects")
-        
-        if tool_name == "get_top_n" and "data" not in params and "objects" in params:
-            # Convert old parameter name to new unified parameter name
-            params["data"] = params.pop("objects")
-        
-        if tool_name == "get_distinct_values" and "data" not in params and "objects" in params:
-            # Convert old parameter name to new unified parameter name
-            params["data"] = params.pop("objects")
-        
-        if tool_name == "create_filter_from_values" and "values" not in params and "group_results" in params:
-            # Convert old parameter name to new unified parameter name
-            params["values"] = params.pop("group_results")
-        
-        # --- PATCH: Ensure required parameters are present ---
-        required_params = {
-            "extract_field_values": ["data", "field_name"],
-            "group_data": ["data", "group_field"],
-            "sort_data": ["data", "sort_field"],
-            "filter_data": ["data_source", "filters"],
-            "get_top_n": ["data", "n"],
-            "get_distinct_values": ["data", "field"],
-            "create_filter_from_values": ["values", "target_field"],
-        }
-        
-        if tool_name in required_params:
-            missing_params = [p for p in required_params[tool_name] if p not in params]
-            if missing_params:
-                logger.error(f"Missing required parameters for {tool_name}: {missing_params}")
-                # Try to add missing parameters with defaults or from previous results
-                if "data" in missing_params and state['intermediate_results']:
-                    params["data"] = state['intermediate_results'][-1]
-                elif "data_source" in missing_params:
-                    params["data_source"] = None  # Default to database query
-                elif "values" in missing_params and state['intermediate_results']:
-                    params["values"] = state['intermediate_results'][-1]
-        # Execute tool with retry logic
-        max_retries = 1
-        for attempt in range(max_retries + 1):
-            try:
-                result = tool_info['func'](**params)
-                result_count = len(result) if hasattr(result, '__len__') else 1
-                log_tool_execution(tool_name, result_count, state['current_step'])
-                break
-            except Exception as e:
-                if attempt < max_retries:
-                    logger.warning(f"Tool {tool_name} failed on attempt {attempt + 1}: {str(e)}")
-                    params = handle_chaining_fallback(tool_name, params, prev_result, schema_fields)
-                    if state['intermediate_results']:
-                        params = substitute_prev_step_refs(params, state['intermediate_results'][-1])
-                else:
-                    error_msg = f"Failed to execute step {state.get('current_step', '?')} ({tool_name}): {str(e)}"
-                    logger.error(error_msg, exc_info=True)
-                    return {**state, 'error': error_msg}
-        
-        # --- PATCH: Prevent infinite recursion by checking retry count ---
-        if '_step_retry_count' in state:
-            state['_step_retry_count'] = state.get('_step_retry_count', 0) + 1
-            if state['_step_retry_count'] > 3:  # Maximum 3 retries per step
-                error_msg = f"Too many retries on step {state['current_step']} ({tool_name}), stopping execution"
-                logger.error(error_msg)
-                return {**state, 'error': error_msg}
+                combined_filter = {"$and": filter_dicts}
         else:
-            state['_step_retry_count'] = 1
-        
-        if '_step_retry_count' in state:
-            del state['_step_retry_count']
+            combined_filter = None
+
+        # Prepare group_by_obj if needed
+        group_by_obj_final = create_groupby_object(group_field) if group_field else None
+
+        # Combine all semantic queries with ' AND '
+        if semantic_queries:
+            semantic_query_final = ' AND '.join(semantic_queries)
+        else:
+            semantic_query_final = None
+
+        if has_semantic:
+            # --- If any semantic_search in plan, push all filters/groupby into near_text ---
+            result = search_tools.execute_combined_query(
+                query=semantic_query_final,
+                filter_obj=search_tools.filter_data(filters=combined_filter) if combined_filter else None,
+                group_by_obj=group_by_obj_final,
+                score_threshold=0.5
+            )
+            # Do not do any client-side groupby/filter after
+            if sort_field:
+                result = search_tools.sort_data(result, sort_field=sort_field, ascending=ascending)
+        else:
+            # --- If no semantic_search, push all filters/sort into fetch_objects ---
+            result = search_tools.objects(
+                filter_obj=search_tools.filter_data(filters=combined_filter) if combined_filter else None,
+                sort_field=sort_field,
+                ascending=ascending,
+                number_of_groups=100,
+                objects_per_group=100
+            )
+            # If groupby is present, do client-side groupby
+            if group_field:
+                result = search_tools.group_data(
+                    result,
+                    group_field=group_field,
+                    limit=None,
+                    include_items=False,
+                    max_items_per_group=3
+                )
         return {
-            'current_step': state['current_step'] + 1,
-            'intermediate_results': state['intermediate_results'] + [result],
-            'final_results': result if isinstance(result, list) else [result],
-            'plan_warnings': state.get('plan_warnings', [])
+            **state,
+            'current_step': len(plan_steps) + 1,  # Jump to end
+            'intermediate_results': state['intermediate_results'] + ([result] if result is not None else []),
+            'final_results': result if result is not None else state.get('final_results', []),
+            'filter_obj': None,
+            'group_by_obj': None,
+            'sort_params': None,
+            'semantic_query': ""
         }
     except Exception as e:
         error_msg = f"Failed to execute step {state.get('current_step', '?')} ({step.get('tool', 'N/A')}): {str(e)}"
@@ -654,11 +512,10 @@ def llm_tailor_response(user_query: str, raw_output: dict, query_decomposer=None
     safe_output = convert_datetimes(raw_output)
     plan_str = json.dumps(search_plan, indent=2) if search_plan else "(No plan provided)"
     prompt = f'''
-You are an expert research assistant. Given the following user query, the search plan (as JSON), and the raw search output (in JSON), generate a clear, complete, and well-formatted answer or summary that directly addresses the user's intent.
+You are an expert research assistant. Given the following user query, the search plan (as JSON), and the raw search output (in JSON), generate a clear, complete, and well-formatted answer that directly addresses the user's intent.
 
 **Important:**
-- Use the search plan to understand the context and the steps taken.
-- Enumerate and display **all results** in the output, not just a sample or summary.
+- Enumerate and display **ALL results** in the output, not just a sample or summary. If the result is a list of unique authors, list every author. Do not omit or summarize results.
 - For articles, list every article with all available fields (title, author, publish_date, category, etc.).
 - For value lists, enumerate every value.
 - Use bullet points, tables, or lists for clarity.
@@ -704,6 +561,28 @@ def summarize_node(state: AgentState, query_decomposer=None) -> Dict[str, Any]:
         if not last_step_result and state.get('final_results'):
             last_step_result = flatten_results(state['final_results'])
             last_step_with_results = len(state.get('intermediate_results', [])) + 1
+        # --- PATCH: If we have final_results, always treat them as coming from the final step ---
+        if state.get('final_results'):
+            last_step_with_results = len(state.get('plan', {}).get('steps', []))
+
+        # --- PATCH: If group_data is present in the plan, group the data before passing to LLM ---
+        plan = state.get('plan', {})
+        group_field = None
+        if plan and 'steps' in plan:
+            for step in plan['steps']:
+                if step.get('tool') == 'group_data' and 'group_field' in step.get('parameters', {}):
+                    group_field = step['parameters']['group_field']
+                    break
+        if group_field and last_step_result and isinstance(last_step_result, list) and len(last_step_result) > 0 and isinstance(last_step_result[0], dict) and 'group_name' not in last_step_result[0]:
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            for item in last_step_result:
+                grouped[item.get(group_field, None)].append(item)
+            last_step_result = [{"group_name": k, "items": v, "item_count": len(v)} for k, v in grouped.items()]
+
+        # PRINT the result that is passed onto the LLM (after all processing)
+        if last_step_result:
+            logger.info("RESULT PASSED TO LLM (for summary):", last_step_result)
         
         if not last_step_result:
             summary = "No results found."
@@ -722,11 +601,9 @@ def summarize_node(state: AgentState, query_decomposer=None) -> Dict[str, Any]:
                     tailored = raw_summary.get('summary', 'No summary available.')
                 if 'plan_warnings' in state and state['plan_warnings']:
                     tailored += "\n" + "\n".join([f"[Warning] {w}" for w in state['plan_warnings']])
-                
                 # Add note if this wasn't the final step
                 if last_step_with_results and last_step_with_results < len(state.get('plan', {}).get('steps', [])):
-                    tailored += f"\n\n[Note: Results shown are from step {last_step_with_results}. The final filter step returned no results.]"
-                
+                    tailored += f"\n\n[Note: Results shown are from step {last_step_with_results}. The final step returned no results.]"
                 return {
                     'summary': tailored,
                     'status': 'success',
@@ -737,17 +614,18 @@ def summarize_node(state: AgentState, query_decomposer=None) -> Dict[str, Any]:
             else:
                 # If the last step's result is a list of dicts (articles), use that for summary
                 raw_summary = format_search_results(state, last_step_result)
+                # PRINT the result that is passed onto the LLM (after all processing)
+                if last_step_result:
+                    logger.info("RESULT PASSED TO LLM (for summary):", last_step_result)
                 if query_decomposer:
                     tailored = llm_tailor_response(state['original_query'], raw_summary, query_decomposer, state.get('plan'))
                 else:
                     tailored = raw_summary.get('summary', 'No summary available.')
                 if 'plan_warnings' in state and state['plan_warnings']:
                     tailored += "\n" + "\n".join([f"[Warning] {w}" for w in state['plan_warnings']])
-                
                 # Add note if this wasn't the final step
                 if last_step_with_results and last_step_with_results < len(state.get('plan', {}).get('steps', [])):
-                    tailored += f"\n\n[Note: Results shown are from step {last_step_with_results}. The final filter step returned no results.]"
-                
+                    tailored += f"\n\n[Note: Results shown are from step {last_step_with_results}. The final step returned no results.]"
                 return {
                     'summary': tailored,
                     'status': 'success',
@@ -761,7 +639,7 @@ def summarize_node(state: AgentState, query_decomposer=None) -> Dict[str, Any]:
             
             # Add note if this wasn't the final step
             if last_step_with_results and last_step_with_results < len(state.get('plan', {}).get('steps', [])):
-                summary += f"\n\n[Note: Results shown are from step {last_step_with_results}. The final filter step returned no results.]"
+                summary += f"\n\n[Note: Results shown are from step {last_step_with_results}. The final step returned no results.]"
             
             result_obj = {
                 "summary": summary,
@@ -921,16 +799,23 @@ class ResearchAgent:
     def _get_tool_registry(self):
         """Get the tool registry for this agent instance."""
         return {
-            "semantic_search": { "func": self.search_tools.semantic_search, "description": "Performs a semantic search.", "parameters": ["query", "limit", "filter_dict", "reference_id", "score_threshold"]},
-            "filter_data": { "func": self.search_tools.filter_data, "description": "Unified filtering that works on any data source.", "parameters": ["data_source", "filters", "limit", "source_type"]},
-            "group_data": { "func": self.search_tools.group_data, "description": "Unified grouping that works on any data structure.", "parameters": ["data", "group_field", "limit", "include_items", "max_items_per_group"]},
-            "sort_data": { "func": self.search_tools.sort_data, "description": "Unified sorting that works on any data structure.", "parameters": ["data", "sort_field", "ascending"]},
-            "extract_field_values": { "func": self.search_tools.extract_field_values, "description": "Extract values for a specific field from any data structure.", "parameters": ["data", "field_name", "limit"]},
-            "create_filter_from_values": { "func": self.search_tools.create_filter_from_values, "description": "Create a filter from a list of values (unified method).", "parameters": ["values", "target_field", "limit"]},
-            "combine_results": { "func": self.search_tools.combine_results, "description": "Combines multiple result lists into one. Useful for merging results from different operations.", "parameters": ["results_list", "deduplicate"]},
-            "get_top_n": { "func": self.search_tools.get_top_n, "description": "Gets the top N objects from any data structure.", "parameters": ["data", "n"]},
-            "find_item_by_field": { "func": self.search_tools.find_item_by_field, "description": "Finds an item by a specific field value and returns its Weaviate ID (UUID). Use this only when you have the exact field value.", "parameters": ["field_name", "field_value"]},
-            "transform_results": { "func": self.search_tools.transform_results, "description": "Transforms results into different formats. Useful for data preparation.", "parameters": ["objects", "transform_type"]},
+            "filter_data": {
+                "func": self.search_tools.filter_data,
+                "description": "Unified filtering that works on any data source.",
+                "parameters": ["filters"]},
+            "group_data": {
+                "func": self.search_tools.group_data,
+                "description": "Unified grouping that works on any data structure.",
+                "parameters": ["group_field", "limit", "include_items", "max_items_per_group"]},
+            "sort_data": {
+                "func": self.search_tools.sort_data,
+                "description": "Unified sorting that works on any data structure.",
+                "parameters": ["data", "sort_field", "ascending"]},
+            "semantic_search": {
+                "func": self.search_tools.semantic_search,
+                "description": "Performs a semantic search using the given query or reference article.",
+                "parameters": ["query", "limit", "filter_dict", "reference_id", "score_threshold", "group_field", "max_items_per_group"],
+            },
         }
 
     def _build_graph(self):
@@ -1192,3 +1077,4 @@ def main():
 # --- Main Execution ---
 if __name__ == "__main__":
     main()
+

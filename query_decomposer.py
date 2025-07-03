@@ -15,7 +15,7 @@ class QueryDecomposer:
         if not api_key:
             raise ValueError("Google API key must be provided")
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-2.0-flash-lite")
+        self.model = genai.GenerativeModel("gemini-2.0-flash")
 
     def decompose(self, query: str, class_name: str, schema_fields: dict, tool_registry: dict) -> Dict[str, Any]:
         try:
@@ -39,10 +39,12 @@ Operator hints:
 - For numeric fields: use $gt, $lt, $gte, $lte, $eq, $in
 - For all fields: $and, $or, $not can be used for combining conditions
 """
-            # --- PATCH: Add explicit instructions and examples for both semantic and pure filter/group queries ---
+            # --- PATCH: Update available step types to match agent logic ---
             prompt = f"""
 You are a query planner for a research database. For each user query, output a JSON plan with a sequence of steps.
 
+- Accumulate all filter, group, and sort parameters before the main query step (semantic_search or filter_data). Only one main query step should be executed.
+- Any additional sort_data or group_data steps should be applied to the results of the previous step, not as new database queries.
 - If the user query is about meaning, similarity, relatedness, or is subjective (e.g., 'about', 'related to', 'similar to', 'discuss', 'find items about ...'), start your plan with a 'semantic_search' step.
 - If the user query is a pure field-based, grouping, or counting query (e.g., 'group all items by field', 'count how many match criteria', 'list all items where ...'), use 'filter_data', 'group_data', and other structured tools as appropriate. Do NOT use 'semantic_search' for these queries.
 - Only use 'semantic_search' if the query requires semantic understanding or similarity.
@@ -50,6 +52,10 @@ You are a query planner for a research database. For each user query, output a J
 - Use 'group_data' for grouping operations.
 - Use 'sort_data' for sorting operations.
 - IMPORTANT: Do NOT use 'find_article_by_title' unless you have the exact title. Instead, use 'semantic_search' to find items and then use 'filter_data' to filter by any criteria.
+
+**CRITICAL: Every semantic_search step must have a non-empty 'query' parameter, which should be the main topic or keywords from the user query.**
+
+**CRITICAL: The plan should accumulate all filter, group, and sort parameters before the main query step (semantic_search or filter_data). Only one main query step should be executed. Any additional sort_data or group_data steps should be applied to the results of the previous step, not as new database queries.**
 
 **CRITICAL: Use the new unified tool names and parameters:**
 - Use 'filter_data' instead of 'filter_objects' or 'filter_existing_objects'
@@ -103,12 +109,6 @@ Available step types:
 - filter_data: for all filtering operations (database or existing objects)
 - group_data: for grouping/aggregation
 - sort_data: for sorting
-- get_top_n: for limiting results
-- find_item_by_field: for fetching an item's ID by any field value (use sparingly)
-- extract_field_values: for extracting specific field values from results
-- create_filter_from_values: for creating filters from any value list
-- combine_results: for merging multiple result sets
-- transform_results: for transforming data formats
 
 Schema for collection '{class_name}':
 {schema_str}
